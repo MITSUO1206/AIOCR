@@ -25,6 +25,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import hashlib
 from typing import List, Dict, Any
 
 import streamlit as st
@@ -329,8 +330,12 @@ if run:
 if texts_preview:
     st.markdown("### 🔍 OCR/ネイティブ抽出テキスト プレビュー")
     for tp in texts_preview:
-        with st.expander(f"{tp['filename']}  (OCR使用: {tp['used_ocr']})", expanded=False):
-            st.text_area("抽出テキスト", value=tp["text"], height=220, key=f"txt_{tp['filename']}")
+        fname = str(tp.get("filename", "no_name")).strip()
+        base  = f"{fname}|{len(tp.get('text',''))}"
+        key   = "txt_" + hashlib.md5(base.encode("utf-8")).hexdigest()
+
+        with st.expander(f"{fname}  (OCR使用: {tp['used_ocr']})", expanded=False):
+            st.text_area("抽出テキスト", value=tp.get("text",""), height=220, key=key)
 
 if extractions:
     st.markdown("### 🧩 Gemini JSON 抽出プレビュー")
