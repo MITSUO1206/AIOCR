@@ -128,7 +128,7 @@ def extract_text_best_effort(pdf_bytes: bytes, tesseract_cmd: str | None = None)
 # =========================================================
 # Gemini 呼び出し
 # =========================================================
-GEMINI_MODEL = "gemini-1.5-flash"
+GEMINI_MODEL = "gemini-2.0-flash"
 
 def init_gemini():
     api_key = get_gemini_api_key()
