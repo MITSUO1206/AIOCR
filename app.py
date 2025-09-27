@@ -3,15 +3,16 @@
 """
 📄 請求書OCR×AI（Gemini）連携アプリ（Streamlit 単一ファイル）
 機能:
-- PDFをドラッグ&ドロップで複数投入
-- ネイティブ抽出（PyMuPDF）→ 空ならOCR（pytesseract + pdf2image）でテキスト化
+- PDF/画像をドラッグ&ドロップで複数投入（PDF, JPG, PNG, TIFF, BMP, WEBP）
+- PDFはネイティブ抽出（PyMuPDF）→ 空ならOCR（pytesseract + pdf2image）でテキスト化
+- 画像はOCR（pytesseract）でテキスト化（TIFFの複数フレームにも対応）
 - 指示テキスト + Gemini で JSON 抽出（strict JSON）
 - JSONプレビュー & 追記予定の表プレビュー
 - 既存Excel（アップロード）へ追記してダウンロード
 - APIキーは st.secrets / 環境変数（.env）から取得（ハードコード禁止）
 
 前提インストール（例）:
-  pip install streamlit google-generativeai python-dotenv pydantic pdf2image pytesseract pymupdf openpyxl pandas
+  pip install streamlit google-generativeai python-dotenv pydantic pdf2image pytesseract pymupdf openpyxl pandas pillow
 Windows:
   - Tesseract をインストールし、実行ファイルパスを通す（例: C:\\Program Files\\Tesseract-OCR\\tesseract.exe）
   - poppler を入れる（pdf2image用）。Windows向けバイナリを導入し、PATHに追加
@@ -34,13 +35,19 @@ from pydantic import BaseModel, Field, ValidationError
 # PDF抽出
 import fitz  # PyMuPDF
 
-# OCR（任意）
+# OCR / 画像
 try:
     from pdf2image import convert_from_bytes
     import pytesseract
     OCR_AVAILABLE = True
 except Exception:
     OCR_AVAILABLE = False
+
+try:
+    from PIL import Image
+    PIL_AVAILABLE = True
+except Exception:
+    PIL_AVAILABLE = False
 
 # Excel / DataFrame
 import pandas as pd
@@ -56,8 +63,6 @@ import google.generativeai as genai
 load_dotenv()  # .env があれば読み込む
 
 def get_gemini_api_key() -> str:
-    # 1) Streamlit Cloud / ローカル: .streamlit/secrets.toml に GEMINI_API_KEY を入れる
-    # 2) ローカル: .env に GEMINI_API_KEY=... を入れる
     key = None
     try:
         key = st.secrets.get("GEMINI_API_KEY")  # type: ignore[attr-defined]
@@ -84,9 +89,23 @@ class InvoiceExtraction(BaseModel):
     明細: List[LineItem]
 
 # =========================================================
-# PDF → テキスト（ネイティブ & OCR フォールバック）
+# ユーティリティ
 # =========================================================
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"}
+PDF_EXT = ".pdf"
 
+def _ext(fname: str) -> str:
+    return os.path.splitext(fname.lower())[-1]
+
+def _is_pdf(fname: str) -> bool:
+    return _ext(fname) == PDF_EXT
+
+def _is_image(fname: str) -> bool:
+    return _ext(fname) in IMAGE_EXTS
+
+# =========================================================
+# PDF/画像 → テキスト（ネイティブ & OCR）
+# =========================================================
 def extract_text_native(pdf_bytes: bytes) -> str:
     text_chunks: List[str] = []
     with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
@@ -94,12 +113,10 @@ def extract_text_native(pdf_bytes: bytes) -> str:
             text_chunks.append(page.get_text("text"))
     return "\n".join(text_chunks).strip()
 
-
-def extract_text_ocr(pdf_bytes: bytes, tesseract_cmd: str | None = None) -> str:
-    if not OCR_AVAILABLE:
+def extract_text_ocr_from_pdf(pdf_bytes: bytes, tesseract_cmd: str | None = None) -> str:
+    if not (OCR_AVAILABLE and PIL_AVAILABLE):
         return ""
     if tesseract_cmd:
-        # WindowsでPATH未設定の場合などに明示
         pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
     try:
         images = convert_from_bytes(pdf_bytes, fmt="png")
@@ -114,16 +131,49 @@ def extract_text_ocr(pdf_bytes: bytes, tesseract_cmd: str | None = None) -> str:
             st.warning(f"OCR失敗: {e}")
     return "\n".join(out).strip()
 
+def extract_text_from_image_bytes(image_bytes: bytes, tesseract_cmd: str | None = None) -> str:
+    """単一画像（JPG/PNG/WEBP/BMP）と複数ページTIFFに対応"""
+    if not (OCR_AVAILABLE and PIL_AVAILABLE):
+        return ""
+    if tesseract_cmd:
+        pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
+    try:
+        im = Image.open(io.BytesIO(image_bytes))
+    except Exception as e:
+        st.warning(f"画像の読み込みに失敗: {e}")
+        return ""
 
-def extract_text_best_effort(pdf_bytes: bytes, tesseract_cmd: str | None = None) -> Dict[str, Any]:
-    native_txt = extract_text_native(pdf_bytes)
-    used_ocr = False
-    if len(native_txt) < 50:  # 空に近い/レイヤ無しPDFっぽい
-        ocr_txt = extract_text_ocr(pdf_bytes, tesseract_cmd)
-        if len(ocr_txt) > len(native_txt):
-            native_txt = ocr_txt
-            used_ocr = True
-    return {"text": native_txt, "used_ocr": used_ocr}
+    texts: List[str] = []
+    try:
+        # マルチフレーム（TIFFなど）を順にOCR
+        i = 0
+        while True:
+            im.seek(i)
+            texts.append(pytesseract.image_to_string(im, lang="jpn+eng"))
+            i += 1
+    except EOFError:
+        pass
+    except Exception as e:
+        st.warning(f"OCR失敗: {e}")
+
+    return "\n".join([t.strip() for t in texts if t]).strip()
+
+def extract_text_best_effort(file_name: str, file_bytes: bytes, tesseract_cmd: str | None = None) -> Dict[str, Any]:
+    """ファイル種別を見て最適な抽出を行う"""
+    if _is_pdf(file_name):
+        native_txt = extract_text_native(file_bytes)
+        used_ocr = False
+        if len(native_txt) < 50:  # 空に近い/レイヤ無しPDFっぽい
+            ocr_txt = extract_text_ocr_from_pdf(file_bytes, tesseract_cmd)
+            if len(ocr_txt) > len(native_txt):
+                native_txt = ocr_txt
+                used_ocr = True
+        return {"text": native_txt, "used_ocr": used_ocr, "kind": "pdf"}
+    elif _is_image(file_name):
+        txt = extract_text_from_image_bytes(file_bytes, tesseract_cmd)
+        return {"text": txt, "used_ocr": True, "kind": "image"}
+    else:
+        return {"text": "", "used_ocr": False, "kind": "unknown"}
 
 # =========================================================
 # Gemini 呼び出し
@@ -136,17 +186,13 @@ def init_gemini():
     model = genai.GenerativeModel(
         model_name=GEMINI_MODEL,
         generation_config={
-            # 可能な限りstrict JSONに寄せる
             "response_mime_type": "application/json",
-            # JSON崩れ対策のため、必要なら temperature を下げる
             "temperature": 0.2,
         },
     )
     return model
 
-
 def build_prompt(user_instruction: str, raw_text: str) -> str:
-    # JSON以外返さない指示を強めに
     schema_hint = {
         "type": "object",
         "properties": {
@@ -169,7 +215,6 @@ def build_prompt(user_instruction: str, raw_text: str) -> str:
         "required": ["請求先", "明細"],
         "additionalProperties": False,
     }
-    # SDKのschema指定は環境差があるため、ここはプロンプト制御で担保
     prompt = (
         "以下は請求書テキストです。あなたは厳密にJSONだけを出力します。\n"
         "日本語キーで次スキーマに厳密一致:\n"
@@ -181,13 +226,11 @@ def build_prompt(user_instruction: str, raw_text: str) -> str:
     )
     return prompt
 
-
 def call_gemini_to_json(model, instruction: str, raw_text: str) -> InvoiceExtraction | None:
     prompt = build_prompt(instruction, raw_text)
     try:
         res = model.generate_content(prompt)
         txt = res.text if hasattr(res, "text") else str(res)
-        # 念のためJSON部分だけ抽出
         start = txt.find("{")
         end = txt.rfind("}")
         if start == -1 or end == -1:
@@ -205,7 +248,6 @@ def call_gemini_to_json(model, instruction: str, raw_text: str) -> InvoiceExtrac
 # =========================================================
 EXPECTED_HEADERS = ["請求先", "提供品名", "数量", "税込単価", "税込金額"]
 
-
 def dataframe_from_extractions(items: List[InvoiceExtraction]) -> pd.DataFrame:
     rows: List[Dict[str, Any]] = []
     for inv in items:
@@ -220,7 +262,6 @@ def dataframe_from_extractions(items: List[InvoiceExtraction]) -> pd.DataFrame:
     df = pd.DataFrame(rows, columns=EXPECTED_HEADERS)
     return df
 
-
 def append_to_excel_bytes(excel_bytes: bytes | None, df: pd.DataFrame) -> bytes:
     if df.empty:
         return excel_bytes or b""
@@ -231,7 +272,6 @@ def append_to_excel_bytes(excel_bytes: bytes | None, df: pd.DataFrame) -> bytes:
         ws = wb.active
         # ヘッダ検証
         if ws.max_row == 0 or [c.value for c in ws[1]] != EXPECTED_HEADERS:
-            # 先頭行にヘッダを書き直す（既存がズレている場合は上書き注意）
             ws.delete_rows(1, ws.max_row)
             ws.append(EXPECTED_HEADERS)
     else:
@@ -260,9 +300,10 @@ with st.sidebar:
     st.info("GEMINI_API_KEY は st.secrets または .env で設定してください。ハードコード禁止。")
     tesseract_cmd = st.text_input(
         "(任意) Tesseract の実行ファイルパス",
-        help="WindowsでPATH未設定のときに指定（例 C:\\\Program Files\\\\Tesseract-OCR\\\\tesseract.exe）",
+        help="WindowsでPATH未設定のときに指定（例 C:\\\\Program Files\\\\Tesseract-OCR\\\\tesseract.exe）",
     )
     st.caption("OCR利用可否: {}".format("OK" if OCR_AVAILABLE else "pdf2image/pytesseract 未導入"))
+    st.caption("画像ライブラリ: {}".format("OK" if PIL_AVAILABLE else "Pillow 未導入"))
 
 st.subheader("1) 既存Excel をドラッグ&ドロップ（追記先）")
 excel_file = st.file_uploader(
@@ -272,12 +313,12 @@ excel_file = st.file_uploader(
     key="excel_uploader",
 )
 
-st.subheader("2) 請求書PDF をドラッグ&ドロップ（複数可）")
-pdf_files = st.file_uploader(
-    "画像系PDFはOCR、テキストPDFはネイティブ抽出を試みます。",
-    type=["pdf"],
+st.subheader("2) 請求書PDF / 画像 をドラッグ&ドロップ（複数可）")
+up_files = st.file_uploader(
+    "PDFはテキスト抽出→必要ならOCR、画像はOCRで読み取ります。",
+    type=["pdf", "jpg", "jpeg", "png", "tif", "tiff", "bmp", "webp"],
     accept_multiple_files=True,
-    key="pdf_uploader",
+    key="doc_uploader",
 )
 
 st.subheader("3) AIへの指示文（抽出ポリシー）")
@@ -301,21 +342,29 @@ extractions: List[InvoiceExtraction] = []
 texts_preview: List[Dict[str, Any]] = []
 
 if run:
-    if not pdf_files:
-        st.warning("PDFが未選択です。")
+    if not up_files:
+        st.warning("PDF/画像が未選択です。")
     else:
+        # 画像処理に必要なライブラリのチェック
+        if any(_is_image(f.name) for f in up_files) and (not OCR_AVAILABLE or not PIL_AVAILABLE):
+            st.error("画像OCRには『pytesseract』『Pillow』が必要です。pipで導入してください。")
         model = init_gemini()
         with st.status("処理中...", expanded=True) as status:
-            st.write("PDFテキスト抽出 → Gemini 解析 → プレビュー生成")
-            for up in pdf_files:
-                pdf_bytes = up.read()
-                info = extract_text_best_effort(pdf_bytes, tesseract_cmd or None)
+            st.write("ドキュメント→テキスト化→Gemini 解析→プレビュー生成")
+            for up in up_files:
+                fbytes = up.read()
+                info = extract_text_best_effort(up.name, fbytes, tesseract_cmd or None)
                 raw_txt = info["text"]
-                texts_preview.append({"filename": up.name, "used_ocr": info["used_ocr"], "text": raw_txt})
+                texts_preview.append({
+                    "filename": up.name,
+                    "used_ocr": info["used_ocr"],
+                    "kind": info["kind"],
+                    "text": raw_txt
+                })
 
-                st.write(f"→ {up.name}: テキスト長 {len(raw_txt)} / OCR: {info['used_ocr']}")
+                st.write(f"→ {up.name} [{info['kind']}] : テキスト長 {len(raw_txt)} / OCR: {info['used_ocr']}")
                 if len(raw_txt) < 10:
-                    st.warning(f"{up.name}: テキストが抽出できませんでした。画像/OCR設定を確認してください。")
+                    st.warning(f"{up.name}: テキストが抽出できませんでした。OCR設定/Tesseractパス等を確認してください。")
                     continue
 
                 parsed = call_gemini_to_json(model, user_instruction, raw_txt)
@@ -328,13 +377,14 @@ if run:
 
 # ===== プレビュー表示 =====
 if texts_preview:
-    st.markdown("### 🔍 OCR/ネイティブ抽出テキスト プレビュー")
+    st.markdown("### 🔍 抽出テキスト プレビュー（PDF/画像）")
     for tp in texts_preview:
         fname = str(tp.get("filename", "no_name")).strip()
         base  = f"{fname}|{len(tp.get('text',''))}"
         key   = "txt_" + hashlib.md5(base.encode("utf-8")).hexdigest()
-
-        with st.expander(f"{fname}  (OCR使用: {tp['used_ocr']})", expanded=False):
+        used_ocr = "Yes" if tp.get("used_ocr") else "No"
+        kind = tp.get("kind", "?")
+        with st.expander(f"{fname}  種別: {kind} / OCR: {used_ocr}", expanded=False):
             st.text_area("抽出テキスト", value=tp.get("text",""), height=220, key=key)
 
 if extractions:
@@ -368,6 +418,6 @@ if extractions:
 
 # フッタ
 st.caption(
-    "注: このアプリはローカルで処理します。APIキーは st.secrets/.env から読み取り、\n"
+    "注: このアプリはローカルで処理します。APIキーは st.secrets/.env から読み取り、"
     "ソースコードへ直書きしません。アップロードされたファイルはセッション内でのみ使用されます。"
 )
